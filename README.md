@@ -90,6 +90,7 @@ Requires MinGW-w64 (i686). Run `Build.sh`; the output is `Build/dinput8.dll` and
 ## Credits
 
 - Widescreen and several system fixes follow the methods of **FusionFix / WidescreenFixesPack by ThirteenAG** (MIT), reimplemented in C from the original executables.
+- uCyborg for the original All-In-One patch
 
 ## Licence
 
