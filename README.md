@@ -4,7 +4,7 @@ Runtime fixes and improvements for **The Suffering** (2004) and **The Suffering:
 
 RiotFix is a `dinput8.dll` proxy (or `.asi` plugin) that patches the game in memory at start-up. **No game file is changed.** Every patch checks the original bytes before touching anything, and anything that does not match is skipped and reported in `RiotFix.log`. One file works for both games.
 
-> Current version: **0.0.8** (work in progress — feedback welcome, see [Testing](#testing)).
+> Current version: **0.2.5** (work in progress — feedback welcome).
 
 ## Installation
 
