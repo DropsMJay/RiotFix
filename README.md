@@ -20,66 +20,98 @@ All options live in `RiotFix.ini`; each one is documented there. `0` / `1` turn 
 
 ## Features and fixes
 
-### Widescreen (`[Widescreen]`)
-- **Hor+ field of view:** wide screens show more at the sides instead of cutting the top and bottom. Cutscenes keep the game's own framing.
-- **`FieldOfView` / `FirstPersonFieldOfView`:** set the horizontal field of view in degrees for any resolution (first-person option: Ties That Bind only for now).
-- **HUD kept at its original proportions** and anchored to its side of the screen (left, centre, right) instead of being stretched; each string of text keeps one anchor so it is never split.
-- **Menus in a centred 4:3 box**, loading screens included.
-- **HUD stays at the sides behind the pause menu** (only the menu goes into the 4:3 box).
-- **Ties That Bind interface scene** (health bar, ammunition, weapon panel) anchored per element, also while paused.
-- **`HudScale`:** make the in-game HUD and its text bigger (1 = original, up to 3). Elements grow away from their corner; the crosshair stays centred; menus keep their size.
-- **`FixInventoryIcons`** (The Suffering): the 3D weapon icons in the inventory were placed with the wrong camera angles, so they landed beside their square and got hidden behind the scenery (a bug of the original game at any resolution). They now sit inside their square, follow the HUD layout and no longer disappear behind objects; inventory cells slide as one piece.
-- **`CutsceneBars`:** keep or remove the black bars of cutscenes.
+## System
 
-### Text (`[Text]`)
-- **Outline:** an even outline around the text instead of the game's offset shadow, for subtitles, HUD, items and menus (`OutlineSize`, `OutlineColor`, `OutlineShadow`).
-- **`OutlineSkipFonts`:** fonts left without an outline (by default the hand-drawn menu font).
+- The game starts on Windows 8 and later without asking for DirectPlay ("DirectX is not installed").
+- Windows no longer flags the game as "not responding".
+- Level loading no longer hangs on multi-core processors.
+- The game no longer refuses to save on disks with a lot of free space.
+- The Riot Engine configuration dialog no longer uses a whole processor core.
+- A screen copy that closed the game (seen in windowed mode) is now skipped.
+- The game no longer forces registry flushes or sends an empty debug message every frame.
+- The game's process no longer stays stuck in Task Manager after the game closes.
+- A frame-rate cap (60 by default), because above that the physics and some animations of both games go wrong.
+- The start-up logo movie can be skipped.
 
-### Mouse and cursor (`[Mouse]`, `[Cursor]`)
-- **`PreciseTime`:** the game timed mouse movement with a 15.6 ms clock, so some frames measured 0 ms, lost their movement and repeated the previous one. Mouse time now comes from a precise timer.
-- **`Cursor Direct`:** the menu cursor kept moving for about 5 frames after the mouse stopped (the game used the largest of the last 10 readings). It now follows the newest reading.
-- **`Cursor PreciseTime`:** the cursor moved by the game's frame time, which comes in 15.6 ms steps and counted about one frame in 16 as 31-32 ms, so the cursor jumped twice as far on those frames (felt as uneven or smoothed movement, mostly in Ties That Bind menus). It now uses the frame time measured with a precise timer.
-- **`Cursor Scale`:** bigger menu cursor (0 = automatic, screen height / 480), drawn smoothly when enlarged and no longer squashed in the 4:3 menu box.
+## Display
 
-### Display (`[Display]`)
-- **`AllResolutions`:** lists every resolution the graphics card offers, in full screen and in windowed mode (the original hides very wide modes and limits windowed mode to 640x480–1600x1200).
-- **`DpiAware`:** Windows no longer scales the game window on scaled desktops (125%, 150%…).
-- **`ConventionalMessageLoop`:** the game handles every pending window message each frame, so Windows no longer flags it as "not responding".
-- **`WaitInConfigurationDialog`:** the Riot Engine configuration dialog no longer uses a whole processor core.
-- **`FixFrontBufferCopy`:** a screen copy without its texture is skipped instead of crashing (seen in windowed mode).
+- Every resolution the graphics card offers is listed, in full screen and in a window.
+- Windows no longer enlarges the game window on scaled desktops (125%, 150%…).
+- The full-screen refresh rate can be chosen.
+- A borderless, centred windowed mode with the cursor kept inside the window; while the window is inactive the game
+  rests instead of using a whole core.
+- The title bar shows the game's name (the first game left it blank) and the RiotFix version, with the build's date
+  and time.
+- Wide screens show more at the sides instead of cutting the top and bottom.
+- The field of view can be set in degrees, in third person and (Ties That Bind only) in first person.
+- The HUD keeps its original proportions and stays on its side of the screen; menus sit in a centred 4:3 box.
+- While the game is paused, the HUD stays at the sides behind the menu.
+- In Ties That Bind, the health bar, ammunition and weapon panel are placed correctly too.
+- Cutscenes keep their original framing, and their black bars can be kept or removed. The game now knows for certain
+  when a cutscene starts and ends, so the picture no longer flickers at the edges on those changes.
+- Notes, photos and maps on the archive screen take the same share of the screen at any resolution (at 1080p notes
+  were too small to read).
+- The Suffering: the 3D weapon icons in the inventory appear inside their squares (a bug of the original game, at
+  any resolution).
 
-### Stability and system (`[System]`, `[Timing]`)
-- **`SkipDirectPlayCheck`:** Direct3D is created without loading DirectPlay, so the game starts on Windows 8 and later without the "DirectX is not installed" / install-DirectPlay prompt.
-- **`FixLoadingDeadlock`:** models and resources are always locked in the same order (level loads could hang on multi-core processors).
-- **`FixDiskSpace`:** reports at most 2 GB of free disk space (with a lot of free space the game misread the value and could refuse to save).
-- **`SkipRegistryFlush`:** skips the forced registry flushes that only block the game.
-- **`SkipFrameDebugOutput`:** skips the empty debug message the game sends every frame.
-- **`SkipIntro`:** skips the start-up logo movie.
+## Accessibility
 
-### Memory (`[Memory]`)
-- **Bigger resource caches:** the budget of each cache (models, textures, animations, sounds, strings, lighting…) can be raised, so the game unloads and reloads resources less often. Levels that ask for less keep the configured budget. `LogUsage=1` logs each cache's peak usage to choose values from real numbers.
-- **The Suffering:** large shadows no longer fill the small texture cache (each 1024 shadow used to count as 4 MB, which made the loader recycle textures until it crashed).
+- One size for the HUD, its text and the cursor, up to three times the original.
+- An even outline on text (subtitles, HUD, items) instead of the game's offset shadow.
 
-### Graphics (`[Shadows]`, `[LOD]`, `[Draw]`)
-- **Sharper shadows:** shadow texture size per character (original 256, up to 2048), with a matching depth buffer when the shadow is larger than the screen.
-- **Shadow options:** fade distance, who casts shadows (player / characters / everything), minimum light angle for longer shadows.
-- **Level of detail:** characters and objects keep their full mesh at longer distances.
-- **Draw distance** (The Suffering): object draw distance multiplier.
+## Controls
 
-### Diagnostics (`[Debug]`)
-- **Crash log:** crashes are logged with location, registers, stack and process memory, and `RiotFix.dmp` is written.
-- Optional logs for testing: `LogCameras`, `LogHud`, `LogMouse`, `LogAxes`, `Trace`.
+- Mouse movement no longer loses frames or repeats the previous one.
+- The menu cursor stops with the mouse and no longer jumps; it is drawn at the screen's size and is not squashed in
+  the 4:3 box.
+- Controller support, which the PC version never had:
+  - the five console layouts, as on the PS2's settings screen;
+  - sticks to move and look; buttons to attack, jump, throw, reload, use, heal, first person, insanity,
+    flashlight, map, pause and weapon changes;
+  - in menus, cross accepts, circle or triangle goes back, the d-pad moves;
+  - buttons follow the keys the player has bound in the game;
+  - keyboard and controller work at the same time;
+  - adjustable dead zone, look speed, and stick swap and inversion.
 
-## Testing
+## Audio
 
-When reporting a problem, please include:
-- which game (The Suffering or Ties That Bind) and your resolution;
-- `RiotFix.log` from the game folder;
-- a screenshot if it is visual.
+- 3D sounds that Windows refused to create since Vista are now created.
+- The game had too few voices and refused about 9 sounds in 10; with more voices almost none are lost.
+- Distant sounds the game refused now play.
+- Cutscene and interface sounds that were never heard now play.
+- Ties That Bind: the levels' reverb works again (Windows 11 no longer has the effect the game asks for, so RiotFix
+  hands it another). The Suffering gains an optional reverb with fifteen environments.
 
-Known open items:
-- Ties That Bind: menu cursor feel after `Cursor PreciseTime` — reports welcome.
-- `FirstPersonFieldOfView` is not available in The Suffering yet.
+## Graphics
+
+- Sharper shadows (up to 2048), with options for distance, who casts shadows and light angle.
+- The Suffering: large shadows no longer fill the texture cache, which made the game crash.
+- Characters and objects keep their full model at longer distances.
+- The Suffering: adjustable object draw distance.
+
+## Modding
+
+- The game's resource budgets (models, textures, animations, sounds, strings, lighting…) can be raised, so levels
+  can hold more and the game unloads and reloads less. Each level sets its own budgets; one that asks for less keeps
+  the configured value, and the log can show each budget's peak use to choose values from real numbers.
+
+## Debug
+
+- A log (RiotFix.log) on every run, with what was applied and what was refused.
+- On a crash: the location, the memory state and a .dmp file.
+- Optional logs for testing: sounds, cameras, HUD, mouse, controller actions, keyboard, memory use.
+- Two games running from the same folder write separate logs.
+- RiotPatch.py writes the shadow and level-of-detail changes straight into the executable, and can set its Large
+  Address Aware flag (optional; RiotFix itself changes no file).
+- Scripts/NameSounds.py reads the game's sound packages and names each sound in the log.
+- Scripts/Args.py tells how many arguments a function of the game takes, for writing new hooks.
+
+## Known bugs
+
+- Wide screens: parts of the scenery vanish at the sides (the cells of the first level, for example), only outside
+  4:3. The two attempts so far (widening the culling and forcing portals open) did not fix it.
+- A separate first-person field of view does not exist in The Suffering yet.
+- Controller in Ties That Bind: not tested in play yet.
 
 ## Building
 
