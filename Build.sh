@@ -11,5 +11,5 @@ Strip=-s
 # with the times in RiotFix.log. Override with RiotFixTimeZone when building elsewhere.
 Stamp=$(TZ=${RiotFixTimeZone:-America/Sao_Paulo} date "+%Y-%m-%d %H:%M %z")
 i686-w64-mingw32-gcc -O2 -Wall -Wextra -shared $Strip -static-libgcc -DRiotFixBuild="\"$Stamp\"" -o Build/dinput8.dll \
-    Source/RiotFix.c Source/RiotCore.c Source/RiotMemory.c Source/RiotRendering.c Source/RiotSystem.c Source/RiotDisplay.c Source/RiotAccessibility.c Source/RiotWindow.c Source/RiotAudio.c Source/RiotSdl.c Source/RiotInput.c Source/RiotPad.c Source/RiotTiming.c Source/RiotDiagnostics.c Source/dinput8.def -lole32 -luuid
+    Source/RiotFix.c Source/RiotCore.c Source/RiotMemory.c Source/RiotRendering.c Source/RiotShader.c Source/RiotSystem.c Source/RiotDisplay.c Source/RiotAccessibility.c Source/RiotWindow.c Source/RiotAudio.c Source/RiotSdl.c Source/RiotInput.c Source/RiotPad.c Source/RiotTiming.c Source/RiotDiagnostics.c Source/dinput8.def -lole32 -luuid
 cp Build/dinput8.dll Build/RiotFix.asi

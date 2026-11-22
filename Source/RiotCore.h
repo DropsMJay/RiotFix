@@ -16,7 +16,13 @@
 
 #define ThisCall __attribute__((thiscall))
 
-#define RiotFixVersion "0.6.13"
+/* A bare number is a release: 0.6.26. A letter after it is a test build on the way to the next one: 0.6.26a,
+ * 0.6.26b, and so on, raised once per build handed over. When the bug it was chasing is fixed or the feature it
+ * was carrying lands, the letters are dropped and the number goes up - 0.6.26c becomes 0.6.27, which is a release
+ * again. So a version with no letter is something that was published, and one with a letter says for itself that
+ * it is not. Before this rule, releases and test builds both took the next number and six of them went in an
+ * evening, which told a bug reporter nothing about what he was running. */
+#define RiotFixVersion "0.6.27"
 /* The build's own date and time, so two builds of the same version can be told apart - which matters while a fix is
  * being tested several times in an evening. Build.sh passes a sortable stamp; __DATE__ / __TIME__ is the fallback so
  * the source still compiles without it. RiotFixBuildVersion is what the log and the window title carry. */
@@ -59,6 +65,7 @@ void RotateLogs(const char *Folder);
 
 float IniFloat(const char *Section, const char *Key, float Default);
 int IniInt(const char *Section, const char *Key, int Default);
+int IniTestInt(const char *Section, const char *Key, int Default);   /* [Testing] first, then the old section */
 
 /* Writes "module+offset" for a code address (e.g. "SUFFERING.EXE+0x4a0ac8"). */
 void AddressName(DWORD Address, char *Out, size_t Size);

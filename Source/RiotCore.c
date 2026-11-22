@@ -44,7 +44,18 @@ void LogInitialize(void) {
     InitializeCriticalSection(&LogLock);
 }
 
+/* The previous run's log is kept, because the run worth reading is often the one before this one.
+ *
+ * A player who hits a crash or a freeze restarts the game to tell someone about it, and starting the game is
+ * exactly what used to destroy the evidence: the log is opened for writing, which empties it. One copy back
+ * costs nothing and has already been wanted twice. */
 void LogOpen(void) {
+    char Previous[MAX_PATH];
+    const int Length = snprintf(Previous, sizeof Previous, "%s", LogPath);
+    if (Length > 4 && Length < (int)sizeof Previous - 10 && !_stricmp(LogPath + Length - 4, ".log")) {
+        strcpy(Previous + Length - 4, ".previous.log");
+        MoveFileExA(LogPath, Previous, MOVEFILE_REPLACE_EXISTING);
+    }
     LogFile = fopen(LogPath, "w");
 }
 
@@ -81,8 +92,22 @@ float IniFloat(const char *Section, const char *Key, float Default) {
     return Buffer[0] ? (float)atof(Buffer) : Default;
 }
 
+/* Numbers, and the words people write when a setting is a switch.
+ *
+ * GetPrivateProfileInt answers 0 for anything that is not a number, so "BlackAndWhite=true" turned the feature off
+ * and said nothing about why. Nobody reading their own file would see the mistake: the line is there, it is
+ * spelled right, and it reads as "on". The words below are accepted for that reason. They cost nothing, because
+ * each one parsed as 0 before, so no file that worked can change meaning. */
 int IniInt(const char *Section, const char *Key, int Default) {
-    return (int)GetPrivateProfileIntA(Section, Key, Default, IniPath);
+    char Buffer[64]; GetPrivateProfileStringA(Section, Key, "", Buffer, sizeof Buffer, IniPath);
+    const char *Text = Buffer;
+    while (*Text == ' ' || *Text == '\t') Text++;
+    if (!*Text) return Default;
+    static const char *const Yes[] = { "true", "yes", "on", "enabled" };
+    static const char *const No[]  = { "false", "no", "off", "disabled" };
+    for (size_t Index = 0; Index < sizeof Yes / sizeof *Yes; Index++) if (!_stricmp(Text, Yes[Index])) return 1;
+    for (size_t Index = 0; Index < sizeof No / sizeof *No; Index++) if (!_stricmp(Text, No[Index])) return 0;
+    return atoi(Text);
 }
 
 /* ================================================================ The game's .rfl */
@@ -147,4 +172,17 @@ void AddressName(DWORD Address, char *Out, size_t Size) {
         char *Base = strrchr(Path, '\\');
         snprintf(Out, Size, "%s+0x%lx", Base ? Base + 1 : Path, Address - (DWORD)Module);
     } else snprintf(Out, Size, "?");
+}
+
+/* The options that exist to answer a question rather than to be set live in [Testing], where a player reading
+ * the .ini can see at a glance that they are not settings. They were in with the rest until then, so each is
+ * still looked for in the section it used to be in - an .ini written before the move keeps working, exactly as
+ * [Shader] does for the settings that came out of [Display].
+ *
+ * Moving a key between sections is not free: the reader looks in one place, and a key that moved without the
+ * reader moving with it reads as absent and takes its default. MenuExtras defaults to 1 and was set to 1, so
+ * nothing would have looked wrong, which is the kind of silence worth avoiding. */
+int IniTestInt(const char *Section, const char *Key, int Default) {
+    if (IniInt("Testing", Key, 0) == IniInt("Testing", Key, 1)) return IniInt("Testing", Key, 0);
+    return IniInt(Section, Key, Default);
 }

@@ -422,14 +422,43 @@ static void BuildVtable(void) {
      * strings: input 0 gets that id, input 1 the next, and so on up the list.
      *
      * Running ids rather than one repeated id is what makes this a measurement. The game resolves these names
-     * correctly for its own devices - a hint reads "Use Mouse4, Enter or E to open lockers" - but the number a
-     * name row stores is not the number the string file carries for the same text, and the step between them has
-     * not been found by reading either file. So the game is asked instead: with a run of ids under the pad's
-     * inputs, one hint that names the pad shows which word came out for which input, and the whole block falls
-     * into place at once. The words will be wrong until the base is right; that is the point. 0xFFFF keeps the
-     * nameless rows, which is how it ships. */
+     * correctly for its own devices - a hint reads "Use Mouse4, Enter or E to open lockers" - and the numbers
+     * below are the ones it uses, measured in the running game rather than deduced from a file.
+     *
+     * How a name is found, all of it confirmed in memory: the row's 32-bit field is an index into an array the
+     * string manager keeps at [manager + 8], reached as [[[0x5B5110]+0xA0]]; the lookup is that array's element,
+     * nothing more (0x45E27F is "return base + Id*4"). The element is not the text - it is the string's own
+     * composite id, (table << 16) | entry, which is exactly the number SurrealEd shows: the keyboard's row for
+     * the left arrow holds 0xE2, the array's entry 0xE2 holds 0x000200A8, and 2_00a8 in the editor is
+     * "Lft Arrow". Two days of trying to match the editor's numbering against the row's failed because they are
+     * two different numbers with a table in between.
+     *
+     * The array already carries the controller's names, twice over - the console had two pads - and the block
+     * below is the first copy. Four indices in the middle of it, 0x13 to 0x16, are empty, and they fall exactly
+     * where the four face buttons belong: on the console those are drawn as icons rather than spelled, so there
+     * is no text for them. They are left nameless here, as is the walk input, which is not a control at all. */
+    static const unsigned short NameIds[PadInputCount] = {
+        0x05,   /* Start                 "START button"              */
+        0x06,   /* Back                  "SELECT button"             */
+        0x07, 0x08, 0x09, 0x0A,   /* left stick   up, down, left, right   */
+        0x0B, 0x0C, 0x0D, 0x0E,   /* right stick  up, down, left, right   */
+        0x0F, 0x10, 0x11, 0x12,   /* d-pad        up, down, left, right   */
+        0xFFFF, 0xFFFF, 0xFFFF, 0xFFFF,   /* the four face buttons: icons on the console, no text here */
+        0x18,   /* left trigger          "L2 button"                 */
+        0x1B,   /* right trigger         "R2 button"                 */
+        0x19,   /* left stick button     "L3 button"                 */
+        0x1C,   /* right stick button    "R3 button"                 */
+        0x17,   /* left shoulder         "L1 button"                 */
+        0x1A,   /* right shoulder        "R1 button"                 */
+        0x1D,   /* left stick, any way   "left analog stick"         */
+        0x20,   /* right stick, any way  "right analog stick"        */
+        0x23,   /* d-pad, any way        "directional button"        */
+        0xFFFF  /* the walk amount is not a control and is never named */
+    };
     for (int Input = 0; Input < PadInputCount; Input++) {
-        const unsigned Id = NameStringId == 0xFFFF ? 0xFFFFFFFFu : NameStringId + (unsigned)Input;
+        unsigned Id = NameIds[Input];
+        if (NameStringId != 0xFFFF) Id = NameStringId + (unsigned)Input;   /* for trying a block by hand */
+        if (Id == 0xFFFF) Id = 0xFFFFFFFFu;
         PadNames[Input][0] = (unsigned short)(0xE000 + Input);
         PadNames[Input][1] = (unsigned short)(Id & 0xFFFF);
         PadNames[Input][2] = (unsigned short)(Id >> 16);
@@ -830,7 +859,7 @@ void RiotPadApply(void) {
     Bindings = IniInt("Controller", "Bindings", 1);
     if (!Bindings) Log("Controller: the pad is a device of the engine but nothing is bound to it ([Controller] "
                        "Bindings=0), which is the port as it stood before any record was installed");
-    AppendRows = IniInt("Controller", "AppendRows", 0);
+    AppendRows = IniTestInt("Controller", "AppendRows", 0);
     RumbleWanted = IniInt("Controller", "Rumble", 1);
     AnalogWalk = IniInt("Controller", "AnalogWalk", 1);
     DumpStrings = IniInt("Debug", "DumpStrings", 0);
@@ -848,8 +877,8 @@ void RiotPadApply(void) {
             "camera %s, buttons %s, shared %s, sideways %s", BindGroups, (BindGroups & 1) ? "yes" : "no",
             (BindGroups & 2) ? "yes" : "no", (BindGroups & 4) ? "yes" : "no", (BindGroups & 8) ? "yes" : "no",
             (BindGroups & 16) ? "yes" : "no");
-    MenuExtras = IniInt("Controller", "MenuExtras", 1);
-    NameStringId = (unsigned)IniInt("Controller", "NameStringId", 0xFFFF);
+    MenuExtras = IniTestInt("Controller", "MenuExtras", 1);
+    NameStringId = (unsigned)IniTestInt("Controller", "NameStringId", 0xFFFF);
     if (NameStringId != 0xFFFF)
         Log("Controller: every input is named with string %u, which is wrong text on purpose ([Controller] "
             "NameStringId) - ids run upwards from there, one per input", NameStringId);

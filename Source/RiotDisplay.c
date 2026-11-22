@@ -832,7 +832,7 @@ static void ApplyWidescreen(void) {
         FixIcons = ReplaceVtableSlot(A->RendererVtable, 41, A->RendererAspect, (DWORD)IconAspect);
         if (FixIcons) RiotTimingOnFrame(IconFrame); else Log("Inventory 3D icons: FAILED (unexpected vtable)");
     }
-    WidenCulling = IniInt("Widescreen", "WidenCulling", 0);
+    WidenCulling = IniTestInt("Widescreen", "WidenCulling", 0);
     OriginalCutsceneFraming = IniInt("Widescreen", "OriginalCutsceneFraming", 1);
     Log("Cutscenes keep their original framing: %s", OriginalCutsceneFraming ? "on" : "off (widened like the game)");
     if (OriginalCutsceneFraming)
@@ -913,8 +913,21 @@ static float AngleFor(DWORD Caller, float Degrees) {
     if (Offset == A->FirstPersonFieldOfViewCall && A->FirstPersonFieldOfViewCall) Horizontal = FirstPersonFieldOfView;
     else for (int Index = 0; Index < 8; Index++) if (A->LevelFieldOfViewCalls[Index] && Offset == A->LevelFieldOfViewCalls[Index]) Horizontal = PlayFieldOfView;
     if (!Horizontal) return Degrees;
-    /* tan(h / 2) = (FrustumHalfWidth / OriginalLensConstant) * AspectDifference * tan(angle / 2) */
-    double Ratio = A->FrustumHalfWidth / OriginalLensConstant * AspectDifference;
+    /* tan(h / 2) = (FrustumHalfWidth / LensConstant) * tan(angle / 2), with the constant that is in force right
+     * now rather than the widescreen one.
+     *
+     * Outside a cutscene the two are the same number: AppliedLensConstant is OriginalLensConstant divided by
+     * AspectDifference, so dividing by it is multiplying by AspectDifference, which is what this line used to do.
+     * Inside one, with [Widescreen] OriginalCutsceneFraming on, they are not, and assuming the widescreen constant
+     * there is what issue #2 reported. The level sets its angle during the opening cutscene; the camera took a lens
+     * already carrying the widescreen correction; and RescaleCameras, which works by multiplying whatever a camera
+     * now holds, applied that same correction a second time when the cutscene handed the view back. Hence a field
+     * of view far wider than the one asked for, only on a new game, and right again after a load - where the
+     * level's call happens with no cutscene in the way. Converting against the constant actually in force leaves
+     * the camera correct for the framing of the moment, and the rescale at the end of the cutscene then moves it
+     * to the other framing exactly once. */
+    const double Constant = AppliedLensConstant > 0.0f ? AppliedLensConstant : OriginalLensConstant / AspectDifference;
+    double Ratio = A->FrustumHalfWidth / Constant;
     return (float)(2.0 * atan(tan(Horizontal * 0.5 / 57.29577951) / Ratio) * 57.29577951);
 }
 static void ThisCall WatchedRendererFieldOfView(void *Renderer, float Degrees) {

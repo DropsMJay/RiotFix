@@ -129,6 +129,12 @@ static int Watched(void *Buffer) {
 }
 
 static volatile LONG PlaysOverPlaying, StopsWhilePlaying, OneShotsCutShort;
+static volatile LONG StoppedEarly, StoppedNearlyDone;   /* the same stops, split by how much was left unplayed */
+/* A stop that leaves less than this has not cut anything off; the comment on the Stop hook says where it comes
+   from and why a percentage was the wrong measure. */
+#define SoundFinishedMilliseconds 100
+static volatile LONG StopsAsked, StopsAskedAtOnce, StopsAskedGone;        /* by handle: asked, no fade, already gone */
+static volatile LONG ObjectStopsAsked, ObjectStopsForced, ObjectStopsGone; /* the same, by sound object */
 static volatile LONG VolumesRaised;
 static const char *ResultName(HRESULT Result);
 
@@ -140,7 +146,12 @@ static const char *ResultName(HRESULT Result);
    is created with DSBCAPS_CTRLFX in software, given the I3DL2 effect and the chosen environment. The effect is one
    per sound, as the engine would have done, so a very loud scene costs more processor than a dry one. */
 static int Reverb, ReverbEverySound, ReverbShortSounds;
+/* Set once DirectSound has answered DSERR_FXUNAVAILABLE to our own SetFX: see GiveUpOnReverb below. */
+static volatile LONG ReverbUnavailable;
+#define ResultFxUnavailable 0x887800DCu
 static DSFXI3DL2Reverb ReverbSettings;
+static volatile LONG ReverbGeneration = 1, EaxGeneration;   /* bumped when the environment changes, so EAX is told */
+static int EaxReverbPut;
 static const struct { const char *Name; DSFXI3DL2Reverb Settings; } ReverbPresets[] = {
     { "generic",        { I3DL2_ENVIRONMENT_PRESET_GENERIC } },
     { "room",           { I3DL2_ENVIRONMENT_PRESET_ROOM } },
@@ -173,6 +184,7 @@ static void ReverbCycleFrame(void) {
     const LONG Level = ReverbSettings.lRoom;
     ReverbSettings = ReverbPresets[ReverbPreset].Settings;
     ReverbSettings.lRoom = Level;   /* the level chosen in the .ini is kept across the environments */
+    InterlockedIncrement(&ReverbGeneration);   /* the next 3D buffer sends it to EAX again */
     Log("[audio] reverb environment: %s", ReverbPresets[ReverbPreset].Name);
 }
 
@@ -298,6 +310,20 @@ static void PutReverb(IDirectSoundBuffer *Buffer) {
     } else {
         InterlockedIncrement(&ReverbsFailed);
         if (ReverbsFailed <= 5) Log("[audio] reverb refused by DirectSound: %s", ResultName(Result));
+        /* GiveUpOnReverb. DSERR_FXUNAVAILABLE means this DirectSound does not do DMO effects at all, and the
+         * reporter's two sessions show what that costs when we keep asking anyway. With Windows' own
+         * dsound.dll: 41 SetFX calls, 41 placed in software. With DSOAL in the game's folder: 64 calls, 64
+         * refused, every one DSERR_FXUNAVAILABLE - DSOAL implements EAX through IKsPropertySet and does not
+         * implement SetFX.
+         *
+         * The refusals are not the real cost. To ask for an effect a buffer must be created with
+         * DSBCAPS_CTRLFX, and that flag forces it into software. So on a DSOAL machine 64 buffers were pushed
+         * out of the 128 hardware voices DSOAL provides, in exchange for a reverb that was never applied to
+         * any of them. One refusal is enough to know the whole session will go the same way, so stop asking:
+         * later buffers are created as the game asked, and the reverb stays off until RiotFix can reach EAX. */
+        if ((unsigned)Result == ResultFxUnavailable && !InterlockedExchange(&ReverbUnavailable, 1))
+            Log("[audio] this DirectSound has no DMO effects (DSERR_FXUNAVAILABLE), so RiotFix will stop asking"
+                " for reverb: the rest of the sounds are left as the game asked for them");
     }
     IDirectSoundBuffer8_Release(Eight);
 }
@@ -396,12 +422,46 @@ static HRESULT WINAPI Stop(IDirectSoundBuffer *Self) {
         const KnownBuffer *Known = FindBuffer(Self);
         if (Known && !Known->Looping) {
             InterlockedIncrement(&OneShotsCutShort);
+            /* How far in it was decides whether this is a defect at all, and the old counter did not ask.
+             *
+             * A one-shot stopped at 97% has finished; stopping it is housekeeping. One stopped at 0% was never
+             * heard. Both were counted the same and reported as "one-shots cut short", so a session with 33 of
+             * them read as 33 faults when nearly all were the harmless kind - which is how a theory survived a
+             * log that should have killed it. They are counted apart now, and the caller is written down for
+             * the ones that matter, because who calls Stop is the whole question: the engine's voice stealer,
+             * a distance cull and a scripted silence are three different bugs. */
+            /* The measure is milliseconds left, not the percentage played, and that correction came out of a
+             * session. Nine of the twenty stops it named left between 34 and 44 ms unplayed - a 356 ms sound
+             * at 89%, a 293 ms one at 85%, a 212 ms one at 84%. They cluster that tightly because they are one
+             * event: the sound reached its end and the stop arrived on the next update, roughly 40 ms later.
+             * None was audible. But "90% played" calls a 356 ms sound with 39 ms left an early stop, so all
+             * nine were reported as genuinely cut off and inflated the only number that mattered.
+             *
+             * 40 ms left is inaudible whatever the sound's length and 400 ms left is audible whatever it is, so
+             * the percentage was measuring the wrong thing. In that session the two groups were 34-44 ms and
+             * 341-2158 ms, with nothing at all in between; 100 ms sits inside that gap, clear of the update
+             * period on one side and far from the real defects on the other. The line prints the number as
+             * well, so a reader can draw the line somewhere else without needing another build. */
             DWORD Position = 0;
-            if (LogAudio && (LogAllSounds || OneShotsCutShort <= 15) &&
-                SUCCEEDED(IDirectSoundBuffer_GetCurrentPosition(Self, &Position, NULL)) && Known->Bytes)
-                Log("[audio] a %lu ms sound was stopped %lu%% of the way through",
-                    (unsigned long)Known->Milliseconds,
-                    (unsigned long)(Position >= Known->Bytes ? 100 : Position * 100 / Known->Bytes));
+            if (SUCCEEDED(IDirectSoundBuffer_GetCurrentPosition(Self, &Position, NULL)) && Known->Bytes) {
+                const DWORD Played = Position >= Known->Bytes ? Known->Bytes : Position;
+                const unsigned long Through = Played * 100 / Known->Bytes;
+                const unsigned long Left = (unsigned long)
+                    ((unsigned long long)(Known->Bytes - Played) * Known->Milliseconds / Known->Bytes);
+                if (Left <= SoundFinishedMilliseconds) InterlockedIncrement(&StoppedNearlyDone);
+                else {
+                    InterlockedIncrement(&StoppedEarly);
+                    if (LogAudio && (LogAllSounds || StoppedEarly <= 60)) {
+                        char Caller[MAX_PATH + 24];
+                        AddressName((DWORD)__builtin_return_address(0), Caller, sizeof Caller);
+                        Log("[audio] a %lu ms sound was stopped with %lu ms still to play (%lu%% in), by %s",
+                            (unsigned long)Known->Milliseconds, Left, Through, Caller);
+                    }
+                }
+                if (Left <= SoundFinishedMilliseconds && LogAudio && LogAllSounds)
+                    Log("[audio] a %lu ms sound was stopped with %lu ms left (%lu%% in; it had finished)",
+                        (unsigned long)Known->Milliseconds, Left, Through);
+            }
         }
     }
     if (Watched(Self)) {
@@ -490,34 +550,330 @@ static const char *ResultName(HRESULT Result) {
     }
 }
 
+/* ================================================================ Which DirectSound is this, and what does it speak
+ *
+ * A wrapper in the game's folder - DSOAL, IndirectSound - replaces dsound.dll and answers the same calls through
+ * something else, OpenAL in DSOAL's case. That matters here because the two ways of asking for reverb are not the
+ * same way:
+ *
+ *   SetFX with a DSEFFECTDESC        the DMO path, which is what both of these games use
+ *   IKsPropertySet with an EAX set   the property-set path, which is how games of the EAX era asked
+ *
+ * DSOAL's own description says it implements EAX by way of OpenAL and that it "fools applications into thinking
+ * there is a hardware accelerated sound device", which is why a log from a machine running it reports 128 hardware
+ * buffers where Windows alone reports none. What it does with SetFX is not stated anywhere found, and absence of a
+ * mention is not an answer - so this asks the thing itself, on the machine it is running on, rather than reasoning
+ * about it. The answer decides whether RiotFix can one day carry the game's reverb across from one path to the
+ * other, and it costs one QueryInterface and four QuerySupport calls, once. */
+typedef struct KsPropertySet KsPropertySet;
+typedef struct {
+    HRESULT (WINAPI *QueryInterface)(KsPropertySet *, const GUID *, void **);
+    ULONG   (WINAPI *AddRef)(KsPropertySet *);
+    ULONG   (WINAPI *Release)(KsPropertySet *);
+    HRESULT (WINAPI *Get)(KsPropertySet *, const GUID *, ULONG, void *, ULONG, void *, ULONG, ULONG *);
+    HRESULT (WINAPI *Set)(KsPropertySet *, const GUID *, ULONG, void *, ULONG, void *, ULONG);
+    HRESULT (WINAPI *QuerySupport)(KsPropertySet *, const GUID *, ULONG, ULONG *);
+} KsPropertySetMethods;
+struct KsPropertySet { const KsPropertySetMethods *Methods; };
+
+static const GUID PlacedBufferId = { 0x279AFA86, 0x4981, 0x11CE, { 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60 } };
+static const GUID PropertySetId  = { 0x31EFAC30, 0x515C, 0x11D0, { 0xA9, 0xAA, 0x00, 0xAA, 0x00, 0x61, 0xBE, 0x93 } };
+static const GUID Eax2ListenerId = { 0x0306A6A8, 0xB224, 0x11D2, { 0x99, 0xE5, 0x00, 0x00, 0xE8, 0xD8, 0xC7, 0x22 } };
+static const GUID Eax2BufferId   = { 0x0306A6A7, 0xB224, 0x11D2, { 0x99, 0xE5, 0x00, 0x00, 0xE8, 0xD8, 0xC7, 0x22 } };
+static const GUID Eax3ListenerId = { 0xA8FA6882, 0xB476, 0x11D3, { 0xBD, 0xB9, 0x00, 0xC0, 0xF0, 0x2D, 0xDF, 0x87 } };
+static const GUID Eax3BufferId   = { 0xA8FA6881, 0xB476, 0x11D3, { 0xBD, 0xB9, 0x00, 0xC0, 0xF0, 0x2D, 0xDF, 0x87 } };
+
+/* ALLPARAMETERS is 1 in both of these sets: the EAX 3.0 header has DSPROPERTY_EAXLISTENER_NONE first and
+ * ALLPARAMETERS second, and DSOAL's own eax.h has EAXSOURCE_NONE first and EAXSOURCE_ALLPARAMETERS second.
+ * This read 2 until the header was obtained, which asks about ENVIRONMENT instead - the probe's answer still
+ * stood, because it proves the property set is live either way, but the number was wrong. */
+#define EaxListenerAllParameters 1
+#define EaxBufferAllParameters   1
+
+/* EAXLISTENERPROPERTIES, EAX 3.0, field for field from Creative's header as shipped in id Software's released
+ * Return to Castle Wolfenstein source. Not written from memory: one field out of place writes a decay time into
+ * a rolloff factor, and the result is silence or noise with nothing in the log to explain it.
+ *
+ * DSOAL defines none of this. Its eax.h carries the GUIDs and the property enum and nothing else, and the bytes
+ * go straight through to the OpenAL driver by a loaded EAXSetDirect, so the layout that matters is Creative's. */
+typedef struct { float x, y, z; } EaxVector;
+typedef struct {
+    unsigned long ulEnvironment;
+    float flEnvironmentSize;
+    float flEnvironmentDiffusion;
+    long  lRoom;
+    long  lRoomHF;
+    long  lRoomLF;
+    float flDecayTime;
+    float flDecayHFRatio;
+    float flDecayLFRatio;
+    long  lReflections;
+    float flReflectionsDelay;
+    EaxVector vReflectionsPan;
+    long  lReverb;
+    float flReverbDelay;
+    EaxVector vReverbPan;
+    float flEchoTime;
+    float flEchoDepth;
+    float flModulationTime;
+    float flModulationDepth;
+    float flAirAbsorptionHF;
+    float flHFReference;
+    float flLFReference;
+    float flRoomRolloffFactor;
+    unsigned long ulFlags;
+} EaxListenerProperties;
+
+#define EaxEnvironmentUndefined 26          /* no preset: the numbers below are used as given */
+#define EaxListenerDefaultFlags 0x0000003Fu /* the six scaling flags the header's DEFAULTFLAGS names */
+#define KsPropertySupportGet 1
+#define KsPropertySupportSet 2
+
+static const GUID EarsId = { 0x279AFA84, 0x4981, 0x11CE, { 0xA5, 0x21, 0x00, 0x20, 0xAF, 0x0B, 0xE5, 0x60 } };
+
+static int EaxProbedPrimary, EaxProbedPlaced;
+static int EaxListenerSettable;   /* what the probe found, for whoever carries the reverb across later */
+
+static void ReportDirectSoundInUse(void) {
+    HMODULE Module = GetModuleHandleA("dsound.dll");
+    char Path[MAX_PATH] = "";
+    if (Module && GetModuleFileNameA(Module, Path, sizeof Path))
+        Log("Audio: DirectSound is %s", Path);
+    else
+        Log("Audio: dsound.dll could not be located in this process");
+}
+
+/* Ask one object whether it carries an EAX property set.
+ *
+ * There are four doors, not one, and the first version of this probe stopped at the first that opened - which is
+ * how it produced an answer that looked conclusive and was not. On a machine running DSOAL it reported "the
+ * property set came from the buffer" and then EAX 2.0 and 3.0 as not offered, and both halves were true: the
+ * object it asked was the primary buffer, that buffer did hand over a property set, and that property set knows
+ * nothing about EAX. The doors it never knocked on were the ones the documentation points at.
+ *
+ * Microsoft's own page gets the property set by calling QueryInterface on a DirectSound 3D buffer, and the
+ * listener half of EAX lives with IDirectSound3DListener, which is reached from the primary buffer. Wine had to
+ * add IKsPropertySet to its primary buffer as a separate change years after the secondary one worked. So an
+ * implementation can answer at one door and be silent at another without being broken, and a probe that stops
+ * early will mislabel it.
+ *
+ * This asks all four and names each in the log: the primary buffer and its 3D listener for the listener
+ * properties, a 3D sound buffer and its 3D interface for the per-sound ones. It only reads. */
+static void AskDoor(const char *Where, void *Object) {
+    KsPropertySet *Set = NULL;
+    if (Object) ((IUnknown *)Object)->lpVtbl->QueryInterface((IUnknown *)Object, &PropertySetId, (void **)&Set);
+    if (!Set) { Log("Audio: %s offers no property set at all", Where); return; }
+    static const struct { const GUID *Id; ULONG Property; const char *Name; } Asked[] = {
+        { &Eax2ListenerId, EaxListenerAllParameters, "EAX 2.0 listener" },
+        { &Eax2BufferId,   EaxBufferAllParameters,   "EAX 2.0 buffer"   },
+        { &Eax3ListenerId, EaxListenerAllParameters, "EAX 3.0 listener" },
+        { &Eax3BufferId,   EaxBufferAllParameters,   "EAX 3.0 buffer"   },
+    };
+    for (size_t Index = 0; Index < sizeof Asked / sizeof *Asked; Index++) {
+        ULONG Support = 0;
+        const HRESULT Result = Set->Methods->QuerySupport(Set, Asked[Index].Id, Asked[Index].Property, &Support);
+        const int CanSet = SUCCEEDED(Result) && (Support & KsPropertySupportSet);
+        Log("Audio: %s, %s: %s", Where, Asked[Index].Name,
+            FAILED(Result) ? "not offered" :
+            CanSet ? ((Support & KsPropertySupportGet) ? "can be read and set" : "can be set") :
+            (Support & KsPropertySupportGet) ? "can be read but not set" : "offered but neither read nor set");
+        if (CanSet && Asked[Index].Id == &Eax3ListenerId && !EaxListenerSettable) {
+            EaxListenerSettable = 1;
+            /* Say what was measured, not what will happen: with no environment named in the .ini there is no
+             * reverb to carry, and the first wording claimed otherwise in a session that had none. */
+            Log("Audio: the EAX 3.0 listener can be set through %s%s", Where, Reverb
+                ? ", so the reverb goes that way instead of through DirectSound effects"
+                : " (no environment is chosen in the .ini, so nothing is sent)");
+        }
+    }
+    Set->Methods->Release(Set);
+}
+
+/* The primary buffer, and the 3D listener that is reached from it: where the listener half of EAX lives. */
+static void ProbeEaxListener(IDirectSoundBuffer *Primary) {
+    if (EaxProbedPrimary) return;
+    EaxProbedPrimary = 1;
+    ReportDirectSoundInUse();
+    AskDoor("the primary buffer", Primary);
+    IDirectSound3DListener *Ears = NULL;
+    if (SUCCEEDED(IDirectSoundBuffer_QueryInterface(Primary, &EarsId, (void **)&Ears)) && Ears) {
+        AskDoor("the 3D listener", Ears);
+        IDirectSound3DListener_Release(Ears);
+    } else {
+        Log("Audio: the primary buffer has no 3D listener to ask");
+    }
+}
+
+/* A 3D sound buffer, and its 3D interface: where the per-sound half lives. */
+static void ProbeEax(IDirectSoundBuffer *Buffer) {
+    if (EaxProbedPlaced) return;
+    EaxProbedPlaced = 1;
+    if (!EaxProbedPrimary) ReportDirectSoundInUse();
+    AskDoor("a 3D sound buffer", Buffer);
+    IDirectSound3DBuffer *Placed = NULL;
+    if (SUCCEEDED(IDirectSoundBuffer_QueryInterface(Buffer, &PlacedBufferId, (void **)&Placed)) && Placed) {
+        AskDoor("that buffer's 3D interface", Placed);
+        IDirectSound3DBuffer_Release(Placed);
+    } else {
+        Log("Audio: that sound buffer has no 3D interface to ask");
+    }
+}
+
+/* The reverb through EAX, for the machines where DirectSound effects do not exist.
+ *
+ * This is the whole reason the probe was built. DSOAL refuses every SetFX with DSERR_FXUNAVAILABLE - 64 of 64
+ * in the session that proved it - and offers EAX 2.0 and 3.0 on its 3D buffers instead. The nine numbers
+ * RiotFix already holds as DSFXI3DL2Reverb are the same nine EAX names in the same units, so the environment
+ * the .ini asks for can be sent either way.
+ *
+ * EAX is a listener property: one call sets the room for every 3D sound at once, where SetFX had to be put on
+ * each buffer separately. So there is nothing to repeat per sound, and no DSBCAPS_CTRLFX, which means the
+ * buffers are no longer forced out of hardware to carry an effect.
+ *
+ * Three of the EAX fields have no I3DL2 counterpart and take the header's own defaults; I3DL2's flDensity has
+ * no EAX counterpart and is dropped. ulEnvironment is set to UNDEFINED so that no preset is applied over the
+ * numbers that follow it - that is the one choice here that the header does not make for us, and it is the
+ * first thing to question if a room comes out sounding like somewhere else. */
+static void ApplyEaxReverb(IDirectSoundBuffer *Buffer) {
+    if (!Reverb || !EaxListenerSettable || EaxGeneration == ReverbGeneration) return;
+    KsPropertySet *Set = NULL;
+    if (FAILED(IDirectSoundBuffer_QueryInterface(Buffer, &PropertySetId, (void **)&Set)) || !Set) return;
+
+    EaxListenerProperties Room;
+    memset(&Room, 0, sizeof Room);
+    Room.ulEnvironment         = EaxEnvironmentUndefined;
+    Room.flEnvironmentSize     = 7.5f;
+    Room.flEnvironmentDiffusion = ReverbSettings.flDiffusion / 100.0f;   /* I3DL2 is a percentage, EAX is 0..1 */
+    Room.lRoom                 = ReverbSettings.lRoom;
+    Room.lRoomHF               = ReverbSettings.lRoomHF;
+    Room.lRoomLF               = 0;
+    Room.flDecayTime           = ReverbSettings.flDecayTime;
+    Room.flDecayHFRatio        = ReverbSettings.flDecayHFRatio;
+    Room.flDecayLFRatio        = 1.0f;
+    Room.lReflections          = ReverbSettings.lReflections;
+    Room.flReflectionsDelay    = ReverbSettings.flReflectionsDelay;
+    Room.lReverb               = ReverbSettings.lReverb;
+    Room.flReverbDelay         = ReverbSettings.flReverbDelay;
+    Room.flEchoTime            = 0.25f;
+    Room.flEchoDepth           = 0.0f;
+    Room.flModulationTime      = 0.25f;
+    Room.flModulationDepth     = 0.0f;
+    Room.flAirAbsorptionHF     = -5.0f;
+    Room.flHFReference         = ReverbSettings.flHFReference;
+    Room.flLFReference         = 250.0f;
+    Room.flRoomRolloffFactor   = ReverbSettings.flRoomRolloffFactor;
+    Room.ulFlags               = EaxListenerDefaultFlags;
+    /* Every field held to the EAX header's own limits, because one out-of-range number loses the whole call.
+     *
+     * Found in play: the F2 key walked the environments and EAX refused exactly one of them, "city", with
+     * E_FAIL, while the other eight went through. The reason is in dsound.h, which contradicts itself - it
+     * defines DSFX_I3DL2REVERB_REVERB_MAX as 2000 and then gives the CITY preset lReverb = 2217. EAX's own
+     * maximum is 2000 as well, so it threw the structure out. It is not a lost minus sign: GENERIC is 200,
+     * BATHROOM 1030 and UNDERWATER 1700, so a positive late reverb is ordinary here and CITY is simply 217
+     * over the line. Clamping is the only legal reading, and it costs 2.17 dB on that one environment.
+     *
+     * That refusal is also the best evidence the field order is right. A misaligned structure would have been
+     * refused for nearly every preset, not one: the values in this table include 5000 for flHFReference and
+     * levels in the -10000..0 range, and the fields they would land on if we were off by a slot have maxima
+     * of 1.0, 0.1 and 0.3. Eight accepted and exactly the one known-bad value refused is what a correct
+     * layout looks like. */
+    #define HoldBetween(Field, Low, High) do { if ((Field) < (Low)) (Field) = (Low); \
+                                               else if ((Field) > (High)) (Field) = (High); } while (0)
+    HoldBetween(Room.flEnvironmentDiffusion, 0.0f, 1.0f);
+    HoldBetween(Room.lRoom, -10000, 0);
+    HoldBetween(Room.lRoomHF, -10000, 0);
+    HoldBetween(Room.flDecayTime, 0.1f, 20.0f);
+    HoldBetween(Room.flDecayHFRatio, 0.1f, 2.0f);
+    HoldBetween(Room.lReflections, -10000, 1000);
+    HoldBetween(Room.flReflectionsDelay, 0.0f, 0.3f);
+    HoldBetween(Room.lReverb, -10000, 2000);
+    HoldBetween(Room.flReverbDelay, 0.0f, 0.1f);
+    HoldBetween(Room.flHFReference, 1000.0f, 20000.0f);
+    HoldBetween(Room.flRoomRolloffFactor, 0.0f, 10.0f);
+    #undef HoldBetween
+
+    const HRESULT Result = Set->Methods->Set(Set, &Eax3ListenerId, EaxListenerAllParameters,
+                                             NULL, 0, &Room, sizeof Room);
+    Set->Methods->Release(Set);
+    EaxGeneration = ReverbGeneration;
+    if (SUCCEEDED(Result)) {
+        EaxReverbPut = 1;
+        Log("[audio] reverb \"%s\" set through EAX 3.0 (level %ld, decay %.2f s): ok",
+            ReverbPresets[ReverbPreset].Name, (long)Room.lRoom, Room.flDecayTime);
+    } else {
+        Log("[audio] reverb refused by EAX 3.0: %s", ResultName(Result));
+    }
+}
+
 /* ================================================================ SetFX (the reverb) */
 static volatile LONG EffectsAsked, EffectsFailed;
+/* What SetFX wrote into the results array, one word per effect. DirectSound fills this whether the call
+   succeeded or not, and on failure it is the only thing that says which effect went wrong and why. */
+static const char *EffectResultName(DWORD Code) {
+    switch (Code) {
+        case DSFXR_PRESENT:     return "present";
+        case DSFXR_LOCHARDWARE: return "placed in hardware";
+        case DSFXR_LOCSOFTWARE: return "placed in software";
+        case DSFXR_UNALLOCATED: return "not allocated";
+        case DSFXR_FAILED:      return "failed";
+        case DSFXR_UNKNOWN:     return "unknown effect";
+        case DSFXR_SENDLOOP:    return "send loop";
+        default:                return "?";
+    }
+}
+
+static volatile LONG EngineAskedHardware;
 static HRESULT WINAPI SetFX(IDirectSoundBuffer8 *Self, DWORD Count, LPDSEFFECTDESC Effects, LPDWORD Results) {
     DSEFFECTDESC Carried[4];
+    DWORD OwnResults[4] = { 0, 0, 0, 0 };
+    const DWORD Room = sizeof Carried / sizeof *Carried;
+    DWORD AskedFlags = 0xFFFFFFFF;
+    /* The game may pass no results array. Lend it ours when it fits, so a failure can be read rather than
+       guessed at; the game never sees it, because it did not ask for one. */
+    LPDWORD Written = Results ? Results : (Count && Count <= Room ? OwnResults : NULL);
     if (!InsideOurSetFX) {
         InterlockedIncrement(&EngineSetFXCalls);
         PrepareEffects();
-        /* The game asks for the one effect this Windows lacks: give it the one that is there instead. */
-        if (CarryEngineReverb && Effects && Count && Count <= sizeof Carried / sizeof *Carried) {
-            int Swapped = 0;
+        if (Effects && Count && Count <= Room) {
+            int Changed = 0, Swapped = 0;
+            AskedFlags = Effects[0].dwFlags;
             for (DWORD Index = 0; Index < Count; ++Index) {
                 Carried[Index] = Effects[Index];
-                if (IsEqualGUID(&Effects[Index].guidDSFXClass, &I3DL2ReverbId)) {
+                /* The one effect this Windows lacks, swapped for one that is here ([Audio] CarryEngineReverb). */
+                if (CarryEngineReverb && IsEqualGUID(&Effects[Index].guidDSFXClass, &I3DL2ReverbId)) {
                     Carried[Index].guidDSFXClass = WavesReverbId;
-                    Swapped = 1;
+                    Swapped = 1; Changed = 1;
+                }
+                /* An effect asked for in hardware, on a Windows that has had no hardware effects since Vista.
+                 * DirectSound answers DSERR_FXUNAVAILABLE for an effect "expected in hardware and found in
+                 * software" and places nothing, so a game written for the hardware era loses its reverb on
+                 * every call. Asking for the same effect in software is the same effect, in the only place it
+                 * can be. The buffers already carry DSBCAPS_CTRLFX and sit in software, so there is nowhere
+                 * else for it to go. */
+                if (Carried[Index].dwFlags & DSFX_LOCHARDWARE) {
+                    Carried[Index].dwFlags = (Carried[Index].dwFlags & ~(DWORD)DSFX_LOCHARDWARE) | DSFX_LOCSOFTWARE;
+                    Changed = 1;
+                    InterlockedIncrement(&EngineAskedHardware);
                 }
             }
-            if (Swapped) { Effects = Carried; InterlockedIncrement(&EngineReverbsCarried); }
+            if (Changed) Effects = Carried;
+            if (Swapped) InterlockedIncrement(&EngineReverbsCarried);
         }
     }
-    const HRESULT Result = OriginalSetFX(Self, Count, Effects, Results);
+    const HRESULT Result = OriginalSetFX(Self, Count, Effects, Written);
     InterlockedIncrement(&EffectsAsked);
     if (FAILED(Result)) InterlockedIncrement(&EffectsFailed);
     if (LogAudio && LogRoom(AudioLogLines, MaximumAudioLogLines)) {
         const char *What = "effect";
         if (Count == 1 && Effects && IsEqualGUID(&Effects[0].guidDSFXClass, &I3DL2ReverbId)) What = "I3DL2 reverb";
-        Log("[audio] SetFX %s on buffer %p asked by %s: %s", What, (void *)Self,
-            InsideOurSetFX ? "RiotFix" : "THE GAME ITSELF", ResultName(Result));
+        char Asked[48] = "", Placed[48] = "";
+        if (AskedFlags != 0xFFFFFFFF)
+            snprintf(Asked, sizeof Asked, ", asked in %s",
+                     AskedFlags & DSFX_LOCHARDWARE ? "hardware (sent to software instead)" :
+                     AskedFlags & DSFX_LOCSOFTWARE ? "software" : "no particular place");
+        if (Written && Count) snprintf(Placed, sizeof Placed, ", %s", EffectResultName(Written[0]));
+        Log("[audio] SetFX %s on buffer %p asked by %s: %s%s%s", What, (void *)Self,
+            InsideOurSetFX ? "RiotFix" : "THE GAME ITSELF", ResultName(Result), Asked, Placed);
     }
     return Result;
 }
@@ -557,7 +913,6 @@ static volatile LONG PlaysAsked, PlaysFailed, PlayLogLines;
  * sound, and took the position away from the sounds that came after it through the same buffer. The mode is
  * therefore decided from the buffer's state at every play and never left behind: turned off for a sound with no
  * position, and turned back on for a sound that has one, undoing a previous play's decision on that same buffer. */
-static const GUID PlacedBufferId = { 0x279afa86, 0x4981, 0x11ce, {0xa5,0x21,0x00,0x20,0xaf,0x0b,0xe5,0x60} };
 static int FixUnplacedSounds;
 static volatile LONG UnplacedSounds, ReplacedSounds;
 
@@ -898,7 +1253,8 @@ static HRESULT WINAPI CreateSoundBuffer(IDirectSound8 *Self, LPCDSBUFFERDESC Des
     if (Description && Description->dwSize >= sizeof Wanted - 4 && Description->dwSize <= sizeof Wanted &&
         !(Description->dwFlags & DSBCAPS_PRIMARYBUFFER)) {
         const int Hardware = (Description->dwFlags & DSBCAPS_LOCHARDWARE) != 0;
-        WantReverb = Reverb && !(Description->dwFlags & DSBCAPS_CTRLFX) && TakesReverb(Description);
+        WantReverb = Reverb && !ReverbUnavailable && !EaxListenerSettable &&
+                     !(Description->dwFlags & DSBCAPS_CTRLFX) && TakesReverb(Description);
         if ((SoftwareBuffers && Hardware) || WantReverb) {
             memset(&Wanted, 0, sizeof Wanted);
             memcpy(&Wanted, Description, Description->dwSize);
@@ -967,6 +1323,12 @@ static HRESULT WINAPI CreateSoundBuffer(IDirectSound8 *Self, LPCDSBUFFERDESC Des
             IDirectSoundBuffer8_Release(Eight);
         }
     }
+    /* Asked of a 3D buffer, because that is where an EAX property set lives when there is one. */
+    if (Buffer && *Buffer && (Description->dwFlags & DSBCAPS_PRIMARYBUFFER)) ProbeEaxListener(*Buffer);
+    else if (Buffer && *Buffer && (Description->dwFlags & DSBCAPS_CTRL3D)) {
+        ProbeEax(*Buffer);
+        ApplyEaxReverb(*Buffer);
+    }
     if (LogAudio && LogRoom(AudioLogLines, MaximumAudioLogLines)) {
         const WAVEFORMATEX *Format = Description->lpwfxFormat;
         const DWORD Bytes = Description->dwBufferBytes;
@@ -1016,13 +1378,22 @@ void RiotAudioReport(void) {
         EffectsAsked, EffectsFailed);
     Log("Audio: of those SetFX calls, %ld came from the game itself and %ld from RiotFix",
         EngineSetFXCalls, EffectsAsked - EngineSetFXCalls);
-    if (Reverb) Log("Audio: reverb put on %ld sounds, refused on %ld", ReverbsPut, ReverbsFailed);
+    if (EaxReverbPut) Log("Audio: the reverb was carried by the EAX 3.0 listener, not by DirectSound effects;"
+                          " no sound had to be moved into software for it");
+    else if (Reverb) Log("Audio: reverb put on %ld sounds, refused on %ld", ReverbsPut, ReverbsFailed);
     if (EngineReverbsCarried) Log("Audio: the game's own reverb carried to the Waves effect on %ld sounds",
                                   EngineReverbsCarried);
     if (PlaysAsked) Log("Audio: %ld sounds asked to play, %ld of those calls failed", PlaysAsked, PlaysFailed);
     if (PlaysAsked) Log("Audio: %ld of those were told to play while already playing; %ld playing sounds were"
-                        " stopped, %ld of them one-shots cut short (the rest were loops ending normally)",
+                        " stopped, %ld of them one-shots (the rest were loops ending normally)",
                         PlaysOverPlaying, StopsWhilePlaying, OneShotsCutShort);
+    if (OneShotsCutShort) Log("Audio: of those one-shots, %ld had finished (under %d ms left) and %ld were"
+                              " genuinely cut off", StoppedNearlyDone, SoundFinishedMilliseconds, StoppedEarly);
+    if (StopsAsked) Log("Audio: the engine asked the sound manager to stop %ld sounds by handle, %ld of them at"
+                        " once with no fade at all, and %ld for a sound that had already gone",
+                        StopsAsked, StopsAskedAtOnce, StopsAskedGone);
+    if (ObjectStopsAsked) Log("Audio: and %ld by sound object, %ld of those forced, %ld for a sound that had"
+                              " already gone", ObjectStopsAsked, ObjectStopsForced, ObjectStopsGone);
     RiotTimingOnFrame(MeasureFrame);
     if (VolumeFloor) Log("Audio: volume floor %ld raised %ld settings the engine had put below it",
                          VolumeFloor, VolumesRaised);
@@ -1030,6 +1401,9 @@ void RiotAudioReport(void) {
                             " their 3d turned off so they could be heard; %ld later sounds got that same buffer with"
                             " a position of their own and had it turned back on", UnplacedSounds, ReplacedSounds);
 }
+
+static void WatchSoundOwners(void);         /* defined at the end of this file */
+static void WatchSoundStopRequests(void);   /* defined at the end of this file */
 
 void RiotAudioApply(void) {
     if (CurrentGame == GameUnknown) return;
@@ -1059,7 +1433,7 @@ void RiotAudioApply(void) {
     /* These two patch the game's own code, so they are applied once and are not part of the loop above - an earlier
      * edit of this file left them inside it, where an empty [Debug] WatchSound meant they never ran at all. */
     static int GateDone;
-    if (!GateDone && IniInt("Audio", "EngineReverb", 0)) {
+    if (!GateDone && IniTestInt("Audio", "EngineReverb", 0)) {
         GateDone = 1;
         if (!A->EffectGateClear) Log("Audio.EngineReverb: this game already asks for reverb by itself");
         else {
@@ -1094,7 +1468,9 @@ void RiotAudioApply(void) {
         Log("Audio: the game now holds %lu voices and %lu placed in 3D", *(const DWORD *)A->VoiceCount,
             *(const DWORD *)A->ThreeDimensionalVoiceCount);
     }
-    VolumeFloor = IniInt("Audio", "VolumeFloor", 0);
+    if (LogAudio) WatchSoundOwners();
+    if (LogAudio) WatchSoundStopRequests();
+    VolumeFloor = IniTestInt("Audio", "VolumeFloor", 0);
     if (VolumeFloor > 0) VolumeFloor = 0;
     if (VolumeFloor < -10000) VolumeFloor = -10000;
     RiotTimingOnFrame(MeasureFrame);
@@ -1134,4 +1510,179 @@ void RiotAudioApply(void) {
     Log("Audio: sound buffers watched (software buffers %s, reverb %s, log %s): %s", SoftwareBuffers ? "on" : "off",
         Reverb ? "on" : "off", LogAudio ? "on" : "off", Hooked ? "ok" : "FAILED (unexpected import table)");
 
+}
+
+/* ================================================================ Why a sound is taken down with its owner
+ *
+ * One of the two ways a one-shot is cut off goes through an object of the engine's own, whose vtable is at
+ * 0x592028: once a frame its slot 39 decides whether to end the sound it holds, and the condition is three
+ * fields - [this+0x100] zero, bit 0x10 of [this+0x28] clear, bit 0x40 clear - with [this+0x24] holding the
+ * sound. What those fields mean is not known. [this+0x100] is filled from [[this+0x64]+4], and the sound
+ * header in a .sdu carries volume in its second field, so volume is the obvious guess and exactly the kind of
+ * guess that has been wrong twice today.
+ *
+ * Reading them by hand in Cheat Engine took two attempts and gave one sample from one object, because a heap
+ * address is only good inside the pause it was read in. Taking the slot over does the same reading on every
+ * object that is about to lose its sound, for as long as the game runs, and costs the player nothing: the
+ * original is called either way, so behaviour is unchanged whatever the numbers turn out to be.
+ *
+ * The Suffering only. Everything here was measured in that build. */
+#define SoundOwnerVtable 0x592028
+#define SoundOwnerUpdateSlot 39
+
+typedef void (ThisCall *SoundOwnerUpdateType)(void *Self);
+static SoundOwnerUpdateType OriginalSoundOwnerUpdate;
+static volatile LONG OwnerTakedownsSeen;
+
+static void ThisCall WatchedSoundOwnerUpdate(void *Self) {
+    if (Self && LogAudio) {
+        const unsigned char *Object = (const unsigned char *)Self;
+        const DWORD Flags    = *(const DWORD *)(Object + 0x28);
+        const DWORD Resource = *(const DWORD *)(Object + 0x64);
+        const DWORD Deciding = *(const DWORD *)(Object + 0x100);
+        const DWORD Sound    = *(const DWORD *)(Object + 0x24);
+        if (Sound && !Deciding && !(Flags & 0x10) && !(Flags & 0x40) &&
+            LogRoom(AudioLogLines, MaximumAudioLogLines) && OwnerTakedownsSeen < 40) {
+            InterlockedIncrement(&OwnerTakedownsSeen);
+            Log("[audio] a sound is about to be taken down with its owner: flags %08lX, resource %08lX,"
+                " the field that decides %lu", (unsigned long)Flags, (unsigned long)Resource,
+                (unsigned long)Deciding);
+        }
+    }
+    OriginalSoundOwnerUpdate(Self);
+}
+
+static void WatchSoundOwners(void) {
+    if (CurrentGame != GamePIH) return;
+    const DWORD Entry = SoundOwnerVtable + 4 * SoundOwnerUpdateSlot;
+    const DWORD Current = *(const DWORD *)Entry;
+    /* Refuse unless the slot still holds what it held when this was measured, so a different build is left
+       alone rather than sent somewhere arbitrary. */
+    if (Current != 0x486D70) {
+        Log("Audio: the sound owner's update is %08lX, not the 486D70 this was measured against; left alone",
+            (unsigned long)Current);
+        return;
+    }
+    OriginalSoundOwnerUpdate = (SoundOwnerUpdateType)Current;
+    const DWORD Ours = (DWORD)&WatchedSoundOwnerUpdate;
+    if (WriteCode(Entry, &Ours, sizeof Ours))
+        Log("Audio: watching why a sound is taken down with its owner ([Debug] LogAudio): ok");
+}
+
+/* ================================================================ Who asks for a sound to stop, and with what fade
+ *
+ * The Stop hook on the DirectSound buffer names the last stop in the chain, and that is not enough: both of the
+ * call sites it ever reports are the same two engine methods, slot 10 and slot 12 of the vtable at 0x58FD98,
+ * and slot 10 is reached both by a hard stop and by the per-frame poll that asks whether a wind-down has
+ * finished. Two different faults arrive at the log looking identical.
+ *
+ * What separates them is one argument, higher up. The sound manager's stop at 0x441200 takes a sound and a
+ * float, and the float is a fade time in seconds - its first instructions compare it with 0.0f at 0x58C2AC and
+ * branch:
+ *
+ *     fade  > 0  ->  0x43AF80, a volume ramp: state 2 at [sound+0x68], rate at [sound+0x50]
+ *     fade <= 0  ->  0x43AEF0, which stops the buffer through slot 10 and lets the sound go
+ *
+ * The executable has exactly four calls to it, and three push a literal zero. So the engine owns a fade and
+ * almost never uses it, and a one-shot that ends at 41% of its length was not faded out - something asked for
+ * silence immediately. Which of the four asked is the whole question, and the four are different bugs:
+ *
+ *     0x44EBAB   zero     stops the sound, then drops it from the list at [this+0x4C]
+ *     0x44EC7E   zero     the same, in a loop over that whole list: "stop everything I own"
+ *     0x4732C4   1.0f     the only fade in the executable, while unlinking a node
+ *     0x486F09   zero     the owner teardown, slot 36 and bit 0x40, documented in Docs/Audio.md
+ *
+ * Each call site is redirected on its own rather than the function's entry being detoured, so the return
+ * address is the exact push that was read in Ghidra and no trampoline is needed. RedirectCall refuses a site
+ * that does not still hold "call 0x441200", so another build is left alone instead of being sent somewhere
+ * arbitrary. The original runs either way: this watches, it does not change what the game does.
+ *
+ * It does not cover the other family. The six stops the log attributes to slot 12 come from Suffering.rfl
+ * through 0x43AECE and never pass through here.
+ *
+ * The Suffering only. Every address was read in that build. */
+#define SoundManagerStop 0x441200
+#define SoundManagerStopByObject 0x4410F0
+#define SoundWasAlreadyGone (-2)     /* 0x441200 and 0x4410F0 both exit this way when the sound is not in the array */
+static const DWORD SoundStopCallSites[] = { 0x44EBAB, 0x44EC7E, 0x4732C4, 0x486F09 };
+static const DWORD ObjectStopCallSites[] = { 0x43EBF0, 0x43EDE2, 0x43EE23, 0x43F2CF, 0x441580, 0x441987 };
+
+typedef int (ThisCall *SoundManagerStopType)(void *Self, DWORD Sound, DWORD Fade);
+static SoundManagerStopType OriginalSoundManagerStop;
+static volatile LONG StopRequestLines;
+
+static int ThisCall WatchedSoundManagerStop(void *Self, DWORD Sound, DWORD Fade) {
+    const DWORD Caller = (DWORD)__builtin_return_address(0);
+    float Seconds;
+    memcpy(&Seconds, &Fade, sizeof Seconds);
+    InterlockedIncrement(&StopsAsked);
+    if (!(Seconds > 0.0f)) InterlockedIncrement(&StopsAskedAtOnce);
+    const int Result = OriginalSoundManagerStop(Self, Sound, Fade);
+    if (Result == SoundWasAlreadyGone) InterlockedIncrement(&StopsAskedGone);
+    if (LogAudio && LogRoom(StopRequestLines, 60)) {
+        char Name[MAX_PATH + 24];
+        AddressName(Caller, Name, sizeof Name);
+        if (Seconds > 0.0f)
+            Log("[audio] sound %08lX asked to fade out over %.2f s by %s (result %d)",
+                (unsigned long)Sound, Seconds, Name, Result);
+        else
+            Log("[audio] sound %08lX asked to stop at once, no fade, by %s (result %d)",
+                (unsigned long)Sound, Name, Result);
+    }
+    return Result;
+}
+
+/* The other door, and the one that matters. A session with the four sites above hooked came back with 21
+ * requests against 34 one-shots genuinely cut off, so they could not be the cause - and the per-caller results
+ * said why: 0x44EBAB asked thirteen times and got "no such sound" thirteen times, and the owner teardown that
+ * cost a morning in Cheat Engine fired once.
+ *
+ * The call graph says where the rest went, and it is exhaustive rather than a guess. 0x43AEF0, the immediate
+ * stop that reaches slot 10, has exactly two callers: 0x44127A inside 0x441200, the door above, which takes a
+ * sound handle; and 0x441145 inside 0x4410F0, which takes the sound OBJECT. Four stops were carried out
+ * through the first, so every other immediate stop in that session came through the second.
+ *
+ * 0x4410F0 is ret 0xC: the object, an index into the manager's array at [this+0x43E] (negative means "find
+ * it"), and a force flag it hands straight to 0x43AEF0. Six call sites, listed above. */
+typedef int (ThisCall *ObjectStopType)(void *Self, void *Sound, int Index, DWORD Force);
+static ObjectStopType OriginalObjectStop;
+static volatile LONG ObjectStopLines;
+
+static int ThisCall WatchedObjectStop(void *Self, void *Sound, int Index, DWORD Force) {
+    const DWORD Caller = (DWORD)__builtin_return_address(0);
+    InterlockedIncrement(&ObjectStopsAsked);
+    if (Force) InterlockedIncrement(&ObjectStopsForced);
+    const int Result = OriginalObjectStop(Self, Sound, Index, Force);
+    if (Result == SoundWasAlreadyGone) InterlockedIncrement(&ObjectStopsGone);
+    if (LogAudio && LogRoom(ObjectStopLines, 60)) {
+        char Name[MAX_PATH + 24];
+        AddressName(Caller, Name, sizeof Name);
+        Log("[audio] sound object %08lX asked to stop%s by %s (result %d)", (unsigned long)(DWORD)Sound,
+            Force ? ", forced," : ",", Name, Result);
+    }
+    return Result;
+}
+
+static void WatchSoundStopRequests(void) {
+    if (CurrentGame != GamePIH) return;
+    const int Sites = (int)(sizeof SoundStopCallSites / sizeof *SoundStopCallSites);
+    OriginalSoundManagerStop = (SoundManagerStopType)SoundManagerStop;
+    int Done = 0;
+    for (int Index = 0; Index < Sites; Index++)
+        Done += RedirectCall(SoundStopCallSites[Index], SoundManagerStop, (DWORD)&WatchedSoundManagerStop);
+    if (Done) Log("Audio: watching who asks for a sound to stop by handle, and with what fade"
+                  " ([Debug] LogAudio): %d/%d call sites", Done, Sites);
+    else Log("Audio: the calls to the sound manager's stop by handle are not where they were measured;"
+             " left alone");
+
+    const int ObjectSites = (int)(sizeof ObjectStopCallSites / sizeof *ObjectStopCallSites);
+    OriginalObjectStop = (ObjectStopType)SoundManagerStopByObject;
+    int ObjectDone = 0;
+    for (int Index = 0; Index < ObjectSites; Index++)
+        ObjectDone += RedirectCall(ObjectStopCallSites[Index], SoundManagerStopByObject,
+                                   (DWORD)&WatchedObjectStop);
+    if (ObjectDone) Log("Audio: watching who asks for a sound to stop by object ([Debug] LogAudio):"
+                        " %d/%d call sites", ObjectDone, ObjectSites);
+    else Log("Audio: the calls to the sound manager's stop by object are not where they were measured;"
+             " left alone");
 }

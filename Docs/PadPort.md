@@ -262,32 +262,75 @@ A hint that names an action - "Use Mouse4, Enter or E to open lockers." - is bui
 Two things follow.
 
 **The pad is skipped on purpose, and that is ours.** The lists are growable, so their size was never the limit;
-what is limited is how many of them the stack frame has room for. There are two, at `esp+0x80` and `esp+0x8C`.
-The third would be `esp+0x98`-`esp+0xA3`, and `esp+0xA0` is a local the function itself clears at `0x40DF1A` -
-which is the overlap that reached the return address and crashed the game. `[Controller] FixHintDeviceList`
-buys safety by refusing device 2 and above, so the pad is never collected and never named. **The real fix is to
-move the array of lists off the stack**: the four instructions above address it as base `esp`, index, 32-bit
-displacement, and the absolute-address form is the same length, so each can be rewritten in place to point at a
-buffer of ours with room for three devices. Before that is written, two things must be found: where the two
-lists are cleared at entry, and where the memory they grow into is freed at exit.
+what is limited is how many of them there are. `[Controller] FixHintDeviceList` buys safety by refusing device
+2 and above, so the pad is never collected and never named.
 
-**A name is either a word or a drawing, and the row decides which.** The row's first word is ignored by the
-indexed lookup, so it is not an identifier: it is the character the font draws when that code is in the hash
-set. On the console a hint reads "Use <cross icon> to open lockers", and that icon is the code itself written
-into the text. On the PC every name comes out as a word, so the set appears to be empty here, but what fills it
-has not been found - there is no direct write to the bucket array anywhere in the executable, so insertion goes
-through a generic helper. `0x40D170` is the predicate ("has this code a drawing?") and `0x40CFC0` the raw find.
+The frame, read from the prologue at `0x40DE80` (`push -1` / `push 0x57E03B` / `push fs:0` / `mov fs:0,esp` /
+`sub esp,0x88`, then `push ebx,esi,edi,ebp`). Offsets are from `esp` in the body, and the epilogue agrees:
+`add esp,0x94` after four pops, and `ret 8`.
 
-### What a name row's id is not
+```
+esp+0x00..0x0F   saved ebp, edi, esi, ebx
+esp+0x10..0x7F   locals
+esp+0x80..0x8B   lists[0]  {Data, Capacity, Count}
+esp+0x8C..0x97   lists[1]
+esp+0x98         saved fs:0, the previous SEH frame      <- lists[2].Data would land here
+esp+0x9C         the SEH handler, 0x57E03B               <- lists[2].Capacity
+esp+0xA0         the __try level                         <- lists[2].Count
+esp+0xA4         return address
+esp+0xA8         first argument                          (0x40DECB reads it, which confirms the layout)
+```
 
-The row's id is **not** the number SurrealEd shows. The game's string file is
-`COMMON\System\System.xdu`: `SRSC` header, strings as UTF-16 with a 16-bit byte length, then a table of
-14-byte records at the end holding `{offset (u32), length (u16), ..., id (u16 at +10), ...}`, where the offset
-points at a string's length prefix and the length counts it. In that file "Death House" is id 0x12 and the
-editor shows `2_0011`, so the editor's number is the id less one. But the keyboard's row for Space carries
-0xA0 while the file gives Space 0x8B, and no constant step fits the mouse either, so a further step exists
-between the two. The game resolves it correctly - the hints name keys and mouse buttons exactly right - so the
-step is real and findable; it has not been found yet.
+An earlier note here said `esp+0xA0` was "a local the function clears at `0x40DF1A`". That is wrong. The eight
+writes to `esp+0xA0` - `0`, `1`, `2`, `3` and `0xFFFFFFFF` at `0x40DF1A`, `0x40DF7E`, `0x40E06E`, `0x40E175`,
+`0x40E3EF`, `0x40E41E`, `0x40E446` and `0x40E4A2` - are the compiler tracking which `__try` block is live. So a
+third device does not graze a local: **it writes its three fields over the entire exception record**, handler
+pointer included. That is why the crash was immediate and total rather than a wrong name on screen.
+
+**Two is designed in, in five places, and all five are immediates.** The array is not a variable-length thing
+that happens to have two entries:
+
+| Where | Bytes | What it says |
+|---|---|---|
+| `0x40E059` | `6A 02` | `push 2` - the element count given to the array constructor at `0x57CD76`, with element size `0xC` and the pair `0x40D8E0` / `0x40D8F0` |
+| `0x40E401` | `6A 02` | the same count given to the destructor at `0x57CE48` |
+| `0x40E149` | `83 FE 50` | `cmp esi,0x50` - the consumer loop walks the device table at `0x5B5418` in steps of `0x28`, so `0x50` is exactly two devices |
+| `0x40E1C1` | `83 FE 02` | a second loop over the same two |
+| `0x40E1C6`, `0x40E3C3` | `83 FD 02` | and the two bounds after it |
+
+**The fix, now fully specified.** Point the array at a buffer of ours and raise the five counts. Nothing new
+has to be assembled - every site is a displacement or an immediate, and each replacement fits the space it
+has:
+
+- the four indexed accesses, `0x40E0C3`, `0x40E0CA`, `0x40E0D1` and `0x40E0F9`, are `base esp + index*4 +
+  disp32`, seven bytes each; dropping the base gives `index*4 + disp32`, also seven bytes (`8B 2C B5`,
+  `8B 0C B5`, `8D 34 B5`, `8B 0C 85` and the address)
+- the constructor's `lea ecx,[esp+0x90]` and the destructor's `lea edx,[esp+0x8C]` are seven bytes; `lea
+  reg,[disp32]` is six, so each takes one `nop`
+- the loop at `0x40E122` takes `lea edi,[esp+0x88]`, and `0x40E17F` `lea edx,[esp+0x88]`, the same way
+- the five counts are one byte each (`02` to the number of devices) and `0x50` becomes `devices * 0x28`
+
+**A correction, and the record of how it happened.** This section once carried a long passage arguing that
+moving the list array would not be enough, because the engine-wide device table at `0x5B5418` holds two entries
+and seven loops bound it there. The table part was read correctly from the retail executable and was useless:
+**RiotFix already moves that table.** `RiotPad.c` relocates it into `MovedArray` with room for eight, rewriting
+24 field references and 6 loop bounds, and the log says so on every run - "the device array moved from 0x5b5418
+to ... with room for 3 devices: 30 references, none left over". Six of the seven loops were already ours.
+
+The lesson is worth more than the finding: that analysis was done against the untouched exe, and what RiotFix
+already patches was never checked. Read the source before reading the binary.
+
+**What is actually left**, and it is only this function's own arithmetic:
+
+- the list array on the stack, the four indexed accesses at `0x40E0C3`, `0x40E0CA`, `0x40E0D1` and `0x40E0F9`,
+  and the constructor's and destructor's `lea` at `0x40E05D` and `0x40E405`, each replaceable in its own length
+- the counts those two calls pass, `6A 02` at `0x40E059` and `0x40E401`
+- the four bounds this function keeps for itself, which `PihBounds` does not cover: `cmp esi,0x50` at `0x40E149`,
+  and `cmp esi,2` / `cmp ebp,2` at `0x40E1C1`, `0x40E1C6` and `0x40E3C3`
+
+One thing is still unproven and decides the shape of the buffer: **does this function recurse, or run on more
+than one thread?** A static buffer is only safe if it does not, and nothing has checked.
+
 ## 8. Ties That Bind
 
 The same, with its own numbers (array `0x6156E8`, speed action `0x400`, slots one further on).

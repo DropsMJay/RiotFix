@@ -23,6 +23,7 @@
 #include "RiotCore.h"
 #include "RiotMemory.h"
 #include "RiotRendering.h"
+#include "RiotShader.h"
 #include "RiotSystem.h"
 #include "RiotAccessibility.h"
 #include "RiotDisplay.h"
@@ -106,6 +107,7 @@ static void Start(HINSTANCE Instance) {
         Log("Game: %s", GameName(CurrentGame));
         RiotMemoryApply();
         RiotRenderingApply();
+        RiotShaderApply();
         RiotSystemApply();
         RiotAccessibilityRead();
         RiotDisplayApply();

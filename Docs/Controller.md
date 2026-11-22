@@ -152,3 +152,38 @@ From the reimplementation's own survey of the retail data, confirmed to be about
 (Replaced.) RiotFix 0.2.x answers the engine's action query with the stick values and turns the buttons into the
 keys the player has bound, in the five PS2 layouts. `Docs/XboxInput.md` sets out what the Xbox code adds on top of
 that and the two ways to port it.
+
+## Why the Controller Settings screen never opens on the PC (measured, from the editor's reference index)
+
+The screens are not missing and the class is not absent. Nothing points at them.
+
+`GUI Options` is a template whose numbered properties name the screens its rows open. Comparing the builds:
+
+| Build | What `GUI Options` points at |
+|---|---|
+| PIH Xbox | p24 -> `GUI Controller Settings` |
+| PIH PC | p27 -> Control Settings GUI (keyboard and mouse). The two controller screens, `5_0357` and `5_035a`, are in the package and **no template cites either** |
+| TTB PC | p30 -> `GUI Controller Settings` (`5_013f`) **and** p31 -> Control Settings GUI |
+
+So the class is registered in the PC build's own class table, the screen is laid out in `Interface.odu`, and in Ties
+That Bind the link is there from the factory. The Suffering is missing one pointer, and that is the whole of it.
+
+This replaces the open question in earlier notes - "who reads the menu lists, and why do the Controller Settings
+rows never surface" - which assumed something in the code was filtering them out. Nothing is: the rows are never
+asked for.
+
+**The cheap test comes before the interesting one.** Ties That Bind already has the link, so opening Options ->
+Controls there needs no modified file and answers the question that matters: whether the class draws at all on
+the PC. If it draws, the implementation in the `.rfl` is sound and The Suffering only lacks the pointer. If it
+comes up blank or takes the game down, the class is the problem and a patched pointer in The Suffering would fail
+the same way, after a file had been swapped for nothing.
+
+**What RiotFix would do, if the pointer is all it takes.** Not ship a modified `Interface.odu`. The same change
+belongs in memory, on the loaded template, after the package is read - no game file touched, and it works whatever
+copy of the game the player owns. What still has to be found for that: where a loaded template's properties live
+in memory, and which slot of the loaded `GUI Options` is p27.
+
+Useful for other work, from the same survey: in 41 of the 52 interface classes the first fourteen properties are a
+shared base, and **p1, p3, p4 and p5 are x, y, width and height as a percentage of the screen**. That is where a
+HUD element's own geometry comes from, which bears on any question of whether RiotFix is placing something wrongly
+or the template already says what it says.

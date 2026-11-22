@@ -1,6 +1,9 @@
 /*
  * RiotRendering - shadows, level of detail and draw distance
  *
+ * The pixel shader the scene is drawn through lives in RiotShader.c, which shares none of this file's
+ * per-game address table.
+ *
  * Every address was confirmed by reverse engineering (RiotEngineNotes.md, section 9j) and every hook checks the
  * original bytes before changing anything. Addresses of 0 mean the feature is absent or not needed in that game.
  *
@@ -334,6 +337,7 @@ static void ApplyOpenPortals(void) {
     Log("Draw: all portals will be kept open (applied on the first frame, after the engine fills its own table)");
     RiotTimingOnFrame(OpenAllPortals);
 }
+
 
 void RiotRenderingApply(void) {
     if (CurrentGame == GameUnknown) return;
